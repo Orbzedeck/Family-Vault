@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol"; // ✅ v0.8.x compatible
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
@@ -18,10 +18,11 @@ contract OrbVault is ReentrancyGuard, Ownable {
     uint256 public lastAlivePing;
     Beneficiary[] public beneficiaries;
 
-    mapping(address => bool) private isBeneficiary; // prevent duplicates
-    mapping(bytes32 => bool) public claimed; // prevent double-claims
+    mapping(address => bool) private isBeneficiary;
+    mapping(bytes32 => bool) public claimed;
 
-    bytes32 public merkleRoot; // Optional for external claims
+    uint256 public totalPercentage; // must equal 10000 at unlock
+    bytes32 public merkleRoot;
     bool public emergencyUnlocked;
 
     event AlivePing(address indexed owner, uint256 timestamp);
@@ -35,6 +36,11 @@ contract OrbVault is ReentrancyGuard, Ownable {
 
     modifier onlyInactiveOwner() {
         require(block.timestamp > lastAlivePing + inactivityPeriod, "Owner still active");
+        _;
+    }
+
+    modifier onlyBeneficiary() {
+        require(isBeneficiary[msg.sender], "Not a beneficiary");
         _;
     }
 
@@ -61,6 +67,7 @@ contract OrbVault is ReentrancyGuard, Ownable {
 
     // ---- Withdraw (Owner only while active) ----
     function withdrawETH(uint256 amount) external onlyOwner nonReentrant {
+        require(block.timestamp <= lastAlivePing + inactivityPeriod, "Owner inactive");
         require(address(this).balance >= amount, "Insufficient ETH");
         (bool success, ) = payable(owner()).call{value: amount}("");
         require(success, "ETH transfer failed");
@@ -68,6 +75,7 @@ contract OrbVault is ReentrancyGuard, Ownable {
     }
 
     function withdrawToken(address token, uint256 amount) external onlyOwner nonReentrant {
+        require(block.timestamp <= lastAlivePing + inactivityPeriod, "Owner inactive");
         IERC20(token).safeTransfer(owner(), amount);
         emit Withdraw(owner(), amount, token);
     }
@@ -76,8 +84,10 @@ contract OrbVault is ReentrancyGuard, Ownable {
     function addBeneficiary(address account, uint256 percentage) external onlyOwner {
         require(account != address(0), "Invalid address");
         require(!isBeneficiary[account], "Already added");
+        require(totalPercentage + percentage <= 10000, "Exceeds 100%");
         beneficiaries.push(Beneficiary(account, percentage));
         isBeneficiary[account] = true;
+        totalPercentage += percentage;
         emit BeneficiaryAdded(account, percentage);
     }
 
@@ -85,7 +95,11 @@ contract OrbVault is ReentrancyGuard, Ownable {
         require(isBeneficiary[account], "Not a beneficiary");
         for (uint i = 0; i < beneficiaries.length; i++) {
             if (beneficiaries[i].account == account) {
+                uint256 old = beneficiaries[i].percentage;
+                uint256 newTotal = totalPercentage - old + newPercentage;
+                require(newTotal <= 10000, "Exceeds 100%");
                 beneficiaries[i].percentage = newPercentage;
+                totalPercentage = newTotal;
                 emit BeneficiaryUpdated(account, newPercentage);
                 break;
             }
@@ -96,6 +110,7 @@ contract OrbVault is ReentrancyGuard, Ownable {
         require(isBeneficiary[account], "Not a beneficiary");
         for (uint i = 0; i < beneficiaries.length; i++) {
             if (beneficiaries[i].account == account) {
+                totalPercentage -= beneficiaries[i].percentage;
                 beneficiaries[i] = beneficiaries[beneficiaries.length - 1];
                 beneficiaries.pop();
                 break;
@@ -107,12 +122,15 @@ contract OrbVault is ReentrancyGuard, Ownable {
 
     // ---- Emergency Unlock ----
     function emergencyUnlock() external onlyInactiveOwner {
+        require(totalPercentage == 10000, "Allocations must equal 100%");
+        require(beneficiaries.length > 0, "No beneficiaries");
         emergencyUnlocked = true;
         emit EmergencyUnlocked(block.timestamp);
     }
 
-    function distributeETH() external nonReentrant {
+    function distributeETH() external nonReentrant onlyBeneficiary {
         require(emergencyUnlocked, "Not unlocked");
+        require(beneficiaries.length > 0, "No beneficiaries");
         uint256 totalBalance = address(this).balance;
         uint256 distributed;
         for (uint i = 0; i < beneficiaries.length; i++) {
@@ -121,16 +139,16 @@ contract OrbVault is ReentrancyGuard, Ownable {
             (bool success, ) = payable(beneficiaries[i].account).call{value: share}("");
             require(success, "ETH transfer failed");
         }
-        // handle dust (send remainder to last beneficiary if any)
-        if (distributed < totalBalance && beneficiaries.length > 0) {
+        if (distributed < totalBalance) {
             uint256 remainder = totalBalance - distributed;
             (bool success, ) = payable(beneficiaries[beneficiaries.length - 1].account).call{value: remainder}("");
             require(success, "Dust transfer failed");
         }
     }
 
-    function distributeToken(address token) external nonReentrant {
+    function distributeToken(address token) external nonReentrant onlyBeneficiary {
         require(emergencyUnlocked, "Not unlocked");
+        require(beneficiaries.length > 0, "No beneficiaries");
         uint256 totalBalance = IERC20(token).balanceOf(address(this));
         uint256 distributed;
         for (uint i = 0; i < beneficiaries.length; i++) {
@@ -138,8 +156,7 @@ contract OrbVault is ReentrancyGuard, Ownable {
             distributed += share;
             IERC20(token).safeTransfer(beneficiaries[i].account, share);
         }
-        // handle dust
-        if (distributed < totalBalance && beneficiaries.length > 0) {
+        if (distributed < totalBalance) {
             uint256 remainder = totalBalance - distributed;
             IERC20(token).safeTransfer(beneficiaries[beneficiaries.length - 1].account, remainder);
         }
