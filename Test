@@ -1,0 +1,100 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "forge-std/Test.sol";
+import "../src/OrbVault.sol";
+
+contract OrbVaultFuzz is Test {
+    OrbVault vault;
+    address owner = address(this);
+    address alice = address(0x1);
+    address bob = address(0x2);
+
+    function setUp() public {
+        vault = new OrbVault(30 days);
+    }
+
+    // ---- Fuzz: Add beneficiary should never exceed 100% ----
+    function testFuzz_AddBeneficiaryWithinLimits(uint256 pct1, uint256 pct2) public {
+        // constrain to 0-10000 bps
+        pct1 = bound(pct1, 0, 10000);
+        pct2 = bound(pct2, 0, 10000);
+
+        // first add always succeeds if <=10000
+        if (pct1 <= 10000) {
+            vault.addBeneficiary(alice, pct1);
+            assertEq(vault.totalPercentage(), pct1);
+        }
+
+        // second add must revert if total > 10000
+        if (pct1 + pct2 > 10000) {
+            vm.expectRevert();
+            vault.addBeneficiary(bob, pct2);
+        } else {
+            vault.addBeneficiary(bob, pct2);
+            assertEq(vault.totalPercentage(), pct1 + pct2);
+        }
+    }
+
+    // ---- Fuzz: Update beneficiary keeps total ≤ 100% ----
+    function testFuzz_UpdateBeneficiaryWithinLimits(uint256 initialPct, uint256 newPct) public {
+        initialPct = bound(initialPct, 0, 10000);
+        newPct = bound(newPct, 0, 10000);
+
+        vault.addBeneficiary(alice, initialPct);
+
+        if (newPct > 10000) {
+            vm.expectRevert();
+            vault.updateBeneficiary(alice, newPct);
+        } else {
+            vault.updateBeneficiary(alice, newPct);
+            assertEq(vault.totalPercentage(), newPct);
+        }
+    }
+
+    // ---- Fuzz: Emergency unlock requires exactly 100% ----
+    function testFuzz_UnlockRequires100(uint256 pct) public {
+        pct = bound(pct, 0, 10000);
+        vault.addBeneficiary(alice, pct);
+
+        vm.warp(block.timestamp + 40 days);
+
+        if (pct != 10000) {
+            vm.expectRevert();
+            vault.emergencyUnlock();
+        } else {
+            vault.emergencyUnlock();
+            assertTrue(vault.emergencyUnlocked());
+        }
+    }
+
+    // ---- Fuzz: Distribution never exceeds balance ----
+    function testFuzz_DistributeETH(uint256 pctAlice, uint256 pctBob, uint256 amount) public {
+        pctAlice = bound(pctAlice, 0, 10000);
+        pctBob = bound(pctBob, 0, 10000 - pctAlice); // force total ≤ 100%
+        amount = bound(amount, 1 ether, 1000 ether);
+
+        vault.addBeneficiary(alice, pctAlice);
+        vault.addBeneficiary(bob, pctBob);
+
+        // force exact 100%
+        uint256 totalPct = pctAlice + pctBob;
+        if (totalPct < 10000) {
+            vault.updateBeneficiary(bob, 10000 - pctAlice);
+        }
+
+        vm.warp(block.timestamp + 40 days);
+        vault.emergencyUnlock();
+
+        vm.deal(address(vault), amount);
+
+        uint256 balBefore = address(this).balance;
+
+        vm.prank(alice);
+        vault.distributeETH();
+
+        uint256 distributed = alice.balance + bob.balance;
+        assertEq(distributed, amount); // nothing lost
+        assertGe(address(this).balance, balBefore); // no caller loss
+    }
+}
